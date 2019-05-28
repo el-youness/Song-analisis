@@ -1,0 +1,298 @@
+---
+title: "R Notebook"
+author: "Youness El idrissi"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r loading and installing libraries}
+# Loading the packages that will be used
+list.of.packages <- c("dplyr", "readr","cluster", "tm", "dbscan", "proxy", "colorspace")
+# (downloading and) requiring packages
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) 
+  install.packages(new.packages)
+for (p in list.of.packages) 
+  require(p, character.only = TRUE)
+rm(list = ls()) # Cleaning environment
+options(header = FALSE, stringsAsFactors = FALSE, fileEncoding = "latin1")
+```
+
+## In this notebook, we will clusterize using different methods, such as, K-means and spectral clustering
+First of all, I will give genral information about the TF-IDF. It is a crutial part of this analisis because we are trying to clusterize text.
+
+TF-IDF or Term Frequency-Inverse Document Frequency is a numerical statistic that demonstrates how important a word is to a corpus, i.e, it is the ratio number of current word to the number of all words in document/string/etc.
+
+Due to the enormous matrix (more thant 30Gb of data) generated if we compute the *dist matrix* with the just 25 000 songs from the dataset. We decided to restrain our trainning to just 1000 sample to show that our models are working. We already tryed with 11500 and the analysis is basically the same (but takes hours to run).
+
+```{r load data}
+song_data<-read.csv("./Dataset/songdata.csv") %>% sample_n(1000)
+#[10000:11000,]
+song_data$text<-as.character(song_data$text)
+```
+
+After creating a corpus object of our text, we will clean the dataset by removing english stop words.
+The warning message `transformation drops documents` is just warning that the text keeping the stopwords is droped and our variable 'cleanset' is keeping only the cleaned text.
+```{r Clearning the corpus, removing stop words ...etc}
+corpus = Corpus(VectorSource(song_data$text)) 
+# Cleaning up 
+cleanset <- tm::tm_map(corpus, tm::removeWords, tm::stopwords('english')) # Removing stop-words
+```
+
+After creating a Document term matrix, using the weightTfIdf method we weight the term document matrix.
+In more details, the term `TF-IDF` gets it's name from weighting the text. 
+Term frequency - inverse document frequency is defined as : $tf_{i,j}*idf_i$ with :
+- $tf_{i,j}$ is the term frequency of term $t$
+- $idf_i$ is thenverse document frequency for a term $t_i$ and is defined as: $$idf_i = \log_2(\frac{D}{\{d \mid t_i \in d \}}) $$
+with $D$ the total number of documents and where $\{d \mid t_i \in d \}$ is the number of documents where the term $t_i$ appears.
+
+```{r Representation and distance matrices}
+# Building the feature matrices
+tdm <- tm::DocumentTermMatrix(cleanset)
+tdm.tfidf <- tm::weightTfIdf(tdm)
+# We remove A LOT of features. R is natively very weak with high dimensional matrix
+tdm.tfidf <- tm::removeSparseTerms(tdm.tfidf, 0.999)
+# There is the memory-problem part
+# - Native matrix isn't "sparse-compliant" in the memory
+# - Sparse implementations aren't necessary compatible with clustering algorithms
+tfidf.matrix <- as.matrix(tdm.tfidf)
+# Cosine distance matrix (useful for specific clustering algorithms)
+dist.matrix = proxy::dist(tfidf.matrix, method = "cosine")
+```
+
+# Silouhette clustering
+This is a very important part that is crucial to determine a good k to use for the clustering:
+$$S_i = \frac{b_i - a_i}{max(b_i - a_i)}$$ 
+with:
+a = average distance to other sample i in the same cluster
+b = average distance to other sample i in closest neighbouring cluster
+
+Sc, the silhouette score is the mean of the sum of all Si for each data point.
+This coefficient varies from -1 to 1, the closer the score is to 1 the better the k is. And this is a suitable for clustering such as k-means.
+
+```{r}
+silhouette_score <- function(k){
+  km <- kmeans(tfidf.matrix, centers = k, nstart=25)
+  ss <- silhouette(km$cluster, dist(tfidf.matrix))
+  mean(ss[, 3])
+}
+k <- 2:10
+avg_sil <- sapply(k, silhouette_score)
+plot(k, type='b', avg_sil, xlab='Number of clusters', ylab='Average Silhouette Scores', frame=FALSE)
+```
+
+# Running the clustering algorithms
+## Partitioning clustering
+As a partitioning clustering, we will use the famous K-means algorithm. As we know the dataset, we can define properly the number of awaited clusters
+```{r Partitioning clustering}
+clustering.kmeans <- kmeans(tfidf.matrix, 2)
+master.cluster <- clustering.kmeans$cluster
+```
+
+To plot our clustering, as our feature spaces is highly dimensional (TF-IDF representation), we will reduce it to 2 thanks to the multi-dimensional scaling.
+This technique is dependent of our distance metric, but in our case with TF-IDF, it is highly preferable than the famous PCA technique.
+```{r}
+points <- cmdscale(dist.matrix, k = 2) # using the PCA technique to reduce dimentionality
+palette <- colorspace::diverge_hcl(4) # Creating a color palette
+```
+
+### Plot
+
+```{r}
+plot(points,
+     main = 'K-Means clustering',
+     col = as.factor(master.cluster),
+     mai = c(0, 0, 0, 0),
+     mar = c(0, 0, 0, 0),
+     xaxt = 'n', yaxt = 'n',
+     xlab = '', ylab = '')
+```
+
+## Hierarchical-based clustering
+Here we use Ward’s Hierarchical Agglomerative Clustering Method`
+Agglomerative Hierarchical clustering Technique: In this technique, initially each data point is considered as an individual cluster. At each iteration, the similar clusters merge with other clusters until one cluster or K clusters are formed.
+It's here that we use the cosine similarity to compute the similarities between clusters.
+```{r Hierarchical clustering}
+clustering.hierarchical <- hclust(dist.matrix, method = "ward.D2")
+slave.hierarchical <- cutree(clustering.hierarchical, k = 2)
+```
+
+### Plot
+```{r}
+plot(points,
+     main = 'Hierarchical clustering',
+     col = as.factor(slave.hierarchical),
+     mai = c(0, 0, 0, 0),
+     mar = c(0, 0, 0, 0),
+     xaxt = 'n', yaxt = 'n',
+     xlab = '', ylab = '')
+```
+
+## Density-based clustering
+To try the density-based clustering, we will run the HDBScan algorithm.
+Regarding the hyper-parameters of the algorithm, a more or less arbitrary value has been fixed.
+
+```{r Density-based clustering}
+clustering.dbscan <- dbscan::hdbscan(dist.matrix, minPts = 10)
+slave.dbscan <- clustering.dbscan$cluster
+```
+
+### Plot
+```{r}
+plot(points,
+     main = 'Density-based clustering',
+     col = as.factor(slave.dbscan),
+     mai = c(0, 0, 0, 0),
+     mar = c(0, 0, 0, 0),
+     xaxt = 'n', yaxt = 'n',
+     xlab = '', ylab = '')
+```
+
+## Stacking clustering
+
+### Generalization
+*Stacked generalization* or *Stacking* is an ensemble technique that uses a new model to learn how to best combine the predictions from two or more models trained on your dataset.
+
+As a final clustering, we will use a hard-voting strategy to merge the results between the 3 previous clustering.
+It goes like this :
+- we define a *master* clustering, all the other are *slave* clusterings. There, we chose arbitrarily the K-means clustering as the *master* clustering
+
+```{r Stacking clustering initialization}
+# Preparing the stacked clustering
+stacked.clustering <- rep(NA, length(master.cluster)) 
+names(stacked.clustering) <- 1:length(master.cluster)
+```
+
+- Then, for each cluster label in the *master* clustering, we define the corresponding stacked clustering as the most found label on the first cluster, then the most found label of the previous found label in the second cluster.
+- This may result in big clusters, which is a risk of an hard-vote stacking clustering. 
+- It is of course not the perfect solution to stack clusterings, but an easy one to implement in R
+
+```{r Stacking clustering execution}
+for (cluster in unique(master.cluster)) {
+  indexes = which(master.cluster == cluster, arr.ind = TRUE)
+  slave1.votes <- table(slave.hierarchical[indexes])
+  slave1.maxcount <- names(slave1.votes)[which.max(slave1.votes)]
+  
+  slave1.indexes = which(slave.hierarchical == slave1.maxcount, arr.ind = TRUE)
+  slave2.votes <- table(slave.dbscan[indexes])
+  slave2.maxcount <- names(slave2.votes)[which.max(slave2.votes)]
+  
+  stacked.clustering[indexes] <- slave2.maxcount
+}
+```
+
+# Plotting the results
+
+```{r Plotting}
+plot(points,
+     main = 'Stacked clustering',
+     col = as.factor(stacked.clustering),
+     mai = c(0, 0, 0, 0),
+     mar = c(0, 0, 0, 0),
+     xaxt = 'n', yaxt = 'n',
+     xlab = '', ylab = '')
+```
+
+# Deep Neural Networks for generating lyrics
+## LSTM (Long Short Term Memory)
+LSTM being part of the Recurent Neural Networks (RNN) familyn it can also be used as generative model.
+This means that in addition to being used for predictive models (making predictions) they can learn the sequences of a problem and then generate entirely new plausible sequences for the problem domain.
+This is exactly what we did. Using an LSTM we endend up generating sample of songs of a specific artist.
+
+We made 2 types of LSTMs, one larger than the other one and has more overfitting. This can be intersting in our case as we will obtain more gramatically correct sentences at first.
+
+We trained both LSTMs on 50 epochs for Eminnem and Rihanna. It took us from hald a day to 5 days of training phase for each artist. We did obtain good results for the first lines of the generation but as the number of epochs increases the model is being overfitted a lot and end up generating the same lyrics as the artist.
+
+  *Eminem* lyrics generated are pretty satisfying, we can see that they match rap style, with long sentences with some punchlines. There are some sentences without any meaning and other that are understandable.
+
+  *Rihanna* lyrics generated with LSTM were bad (with 9000 lines of lyrics). Always the same words were generated, the RNN didn’t learn well from the training data which was obviously too large, because we didn’t have powerful enough machines to allow the LSTM to learn efficiently from this amount of data.
+
+So, we decided to retrain this LSTM with a smaller amount of lines, and the results were better : Rihanna (R&B) style can be easily noticeable, and sentences are globally understandable despite the fact that there’s no link between them.
+
+We would have liked to have more computing power, in order to be able to generate more artists’ lyrics, in to train the LSTMs to be more performent.
+
+The output of out LSTMs is referenced below in the output part.
+
+# Output of the LSTM
+#### Eminem Lyrics our LSTM generated (trained with 500 lines of lyrics) : 3-4 hours of training, 100 epochs
+
+those pills,
+so take that thing away to come back later, just to clutch in those steel
+blades, baby when i cut ya don't squeal,
+i hate the loud noises, i fuckin' told you!
+i keep hearin' voices, like \"wouldn't ya like to go an get your butcher knife,
+and push it right through her, while ya put your shish-kebab skewers
+i'm alioging your a soslen inet to throe cic so my hamd uoual i siot cewch wpur fnt ma dossne paneem coeat whth a pats
+of pail
+paies tp whky youl shese b"pwsl bl fl thes i ll no lo daat to mn thes botcy iewo to yake tp nake
+the wordd i cin't goin he oo that i was boen she watle wpaples lree you wett
+hows it feel now, yeah, funny ain't it, you neglected me
+did me a favor although my spirit free you've said
+but a special place for you in my heart i have kept
+its unfortunate but its
+
+[chorus]
+too late for the other side
+caught in a chase
+twenty five to life
+
+"
+"oh oh
+oh(yea) oh(yea) oh(yea)
+oh oh
+
+#### Rihanna Lyrics generated by the LSTM (trained with 9000 lines of lyrics) : 5 days training - 73 epochs
+
+geel a little thing call  
+i wanna be to be  
+it's gonna say it (yeah yeah)  
+i don't know what to lake it to me  
+  
+i dan't ceel me to me  
+  
+i dan't ceel me to me  
+  
+i dan't ceel the one  
+i don't wanna be me  
+i don't wanna be me  
+i don't wanna be ma na na na na na na la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la
+
+#### Rihanna Lyrics generated by the LSTM (trained with 500 lines of lyrics) : 3-4 hours training - 100 epochs
+
+ya know they talk about ya and they tell the lies
+don't be fooled you betta recognize
+they not there for you
+they don't care for you
+trust me 'cause i know its true
+ya see they smile in your face and make ya think they down
+then they turn against you when your not around
+its just jealousy and dishonesty
+so hold on to your sanity
+
+[hook]
+
+"
+"bum bum be-dum bum bum be-dum bum
+bum bum be-dum bum bum be-dum bum
+bum bum be-dum bum bum be-dum bum
+
+
+# Bibliography
+
+### TFIDF
+- A simple example of text clustering using R: https://www.youtube.com/watch?v=-2Koi-caSZw
+
+### K-means
+- Text clustering with K-means and tf-idf: https://medium.com/@MSalnikov/text-clustering-with-k-means-and-tf-idf-f099bcf95183
+- Text Clustering with R: an Introduction for Data Scientists: https://medium.com/@SAPCAI/text-clustering-with-r-an-introduction-for-data-scientists-c406e7454e76
+
+### Hierarchical clustering
+https://towardsdatascience.com/understanding-the-concept-of-hierarchical-clustering-technique-c6e8243758ec
+http://adn.biol.umontreal.ca/~numericalecology/Reprints/Murtagh_Legendre_J_Class_2014.pdf
+
+### Silhouette
+https://scikit-learn.org/stable/auto_examples/cluster/plot_kmeans_silhouette_analysis.html
+https://medium.com/codesmart/r-series-k-means-clustering-silhouette-794774b46586
+https://towardsdatascience.com/unsupervised-machine-learning-clustering-analysis-d40f2b34ae7e
